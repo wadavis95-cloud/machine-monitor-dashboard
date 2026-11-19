@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Engine 1 · Simulated run to failure</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #17283a; background: #edf2f6; }
+    body { margin: 0; }
+    main { max-width: 70rem; margin: auto; padding: clamp(1rem, 4vw, 3rem); }
+    h1, h2, p { margin: 0; }
+    header p, .chart-panel p { margin-top: .5rem; color: #455a70; }
+    .status { margin: 1.25rem 0; padding: .75rem 1rem; background: #dcebf3; border-radius: .5rem; }
+    dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 13rem), 1fr)); gap: .75rem; }
+    dl > div, .chart-panel { background: white; border: 1px solid #d3dfe8; border-radius: .75rem; padding: 1rem; }
+    dt { font-size: .9rem; color: #455a70; }
+    dd { margin: .4rem 0 0; font-size: 1.4rem; font-weight: 650; font-variant-numeric: tabular-nums; }
+    .warning { margin-top: 1rem; padding: .75rem 1rem; border-radius: .5rem; background: #fff1d0; color: #613900; }
+    .warning[data-level="attention"] { background: #fce6e8; color: #851c2a; }
+    .warning button { margin-top: .5rem; font: inherit; }
+    .chart { position: relative; height: clamp(15rem, 45vh, 28rem); margin-top: 1rem; }
+  </style>
+  <!-- Load Chart.js for the sensor history plot. -->
+  <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.9/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Engine 1 · Simulated run to failure</h1>
+      <p>Every engine in NASA’s C-MAPSS FD001 training dataset is simulated until it fails. This replay shows one reading per operating cycle.</p>
+    </header>
+
+    <p class="status" id="status" role="status">Waiting for the first reading…</p>
+
+    <section aria-labelledby="latest-heading">
+      <h2 id="latest-heading">Latest readings</h2>
+      <dl>
+        <div><dt>Operating cycle</dt><dd id="cycle">—</dd></div>
+        <div><dt>Low-pressure compressor outlet (T24)</dt><dd><span id="s_2">—</span> °R</dd></div>
+        <div><dt>High-pressure compressor outlet (T30)</dt><dd><span id="s_3">—</span> °R</dd></div>
+        <div><dt>Low-pressure turbine outlet (T50)</dt><dd><span id="s_4">—</span> °R</dd></div>
+      </dl>
+    </section>
+
+    <section class="chart-panel" aria-labelledby="chart-heading">
+      <h2 id="chart-heading">Low-pressure compressor outlet temperature</h2>
+      <p>Sensor T24 (s_2), in degrees Rankine, over the cycles shown in this replay.</p>
+      <p>Shaded band: typical early-run T24 range ({{ "%.2f"|format(t24_band.lower) }}–{{ "%.2f"|format(t24_band.upper) }} °R), based on the middle 90% of readings from cycles 1–30 of the other engines. Yellow marks repeated high readings (three in the last ten cycles). Red marks five consecutive cycles outside the band. The diamond marks simulated failure.</p>
+      <div class="warning" id="warning" hidden>
+        <p id="warning-message" role="status"></p>
+        <button id="acknowledge" type="button">Acknowledge</button>
+      </div>
+      <div class="chart">
+        <canvas id="chart" role="img" aria-label="Low-pressure compressor outlet temperature in degrees Rankine by operating cycle"></canvas>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    window.addEventListener("DOMContentLoaded", () => {
+      const fields = ["cycle", "s_2", "s_3", "s_4"];
+      const status = document.getElementById("status");
+      const band = {{ t24_band | tojson }};
+      const finalCycle = {{ final_cycle | tojson }};
+      const warning = document.getElementById("warning");
+      const warningMessage = document.getElementById("warning-message");
+      document.getElementById("acknowledge").addEventListener("click", () => {
+        warning.hidden = true;
+      });
+
+      // Draw the reference range behind the sensor trace.
+      const referenceBand = {
+        id: "referenceBand",
+        beforeDatasetsDraw({ ctx, chartArea, scales }) {
+          const top = scales.y.getPixelForValue(band.upper);
+          const bottom = scales.y.getPixelForValue(band.lower);
+          ctx.save();
+          ctx.fillStyle = "#dcebf3";
+          ctx.fillRect(chartArea.left, top, chartArea.width, bottom - top);
+          ctx.restore();
+        }
+      };
+      const chart = new Chart(document.getElementById("chart"), {
+        type: "line",
+        plugins: [referenceBand],
+        data: {
+          datasets: [
+            { label: "Simulated failure endpoint", data: [], showLine: false, pointStyle: "rectRot", pointRadius: 6, borderColor: "#a52835", backgroundColor: "#a52835" },
+            { label: "Needs attention · sustained deviation", data: [], showLine: false, pointRadius: 4, borderColor: "#a52835", backgroundColor: "#c63845" },
+            { label: "Warning · repeated high readings", data: [], showLine: false, pointRadius: 4, borderColor: "#805600", backgroundColor: "#efd035" },
+            { label: "T24 (°R)", data: [], borderColor: "#006d83", pointRadius: 0, pointHitRadius: 8 }
+          ]
+        },
+        options: {
+          animation: false,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { type: "linear", title: { display: true, text: "Operating cycle" }, ticks: { precision: 0 } },
+            y: { suggestedMin: band.lower, suggestedMax: band.upper, title: { display: true, text: "Temperature (°R)" } }
+          }
+        }
+      });
+
+      // Poll every half second, skipping ticks while a request is pending.
+      const [failure, deviations, highWarnings, trace] = chart.data.datasets;
+      let outsideStreak = [];
+      let recentHighs = [];
+      let repeatedHighs = false;
+      let previousCycle;
+      let pending = false;
+      const timer = setInterval(async () => {
+        if (pending) return;
+        pending = true;
+
+        try {
+          const response = await fetch("/api/engine/1/next");
+          if (!response.ok) throw new Error("Request failed");
+
+          const reading = await response.json();
+          if (reading.done === true) {
+            clearInterval(timer);
+            status.textContent = "Replay complete · Simulated failure endpoint at cycle {{ final_cycle }}.";
+            return;
+          }
+
+          for (const field of fields) {
+            document.getElementById(field).textContent = reading[field];
+          }
+          const point = { x: reading.cycle, y: reading.s_2 };
+          trace.data.push(point);
+
+          if (reading.cycle !== previousCycle + 1) {
+            outsideStreak = [];
+            recentHighs = [];
+            repeatedHighs = false;
+          }
+          previousCycle = reading.cycle;
+          if (point.y < band.lower || point.y > band.upper) {
+            outsideStreak.push(point);
+            if (outsideStreak.length === 5) {
+              deviations.data.push(...outsideStreak);
+              warning.dataset.level = "attention";
+              warningMessage.textContent = `Needs attention. Review T24 trend. Outside the fleet range since cycle ${outsideStreak[0].x}. Warning triggered at cycle ${point.x}.`;
+              warning.hidden = false;
+            } else if (outsideStreak.length > 5) {
+              deviations.data.push(point);
+            }
+          } else {
+            outsideStreak = [];
+          }
+
+          recentHighs = recentHighs.filter(high => high.x >= point.x - 9);
+          const isHigh = point.y > band.upper;
+          if (isHigh) recentHighs.push(point);
+          if (recentHighs.length >= 3 && isHigh && outsideStreak.length < 5) {
+            highWarnings.data.push(point);
+            if (!repeatedHighs && (warning.hidden || warning.dataset.level !== "attention")) {
+              warning.dataset.level = "warning";
+              warningMessage.textContent = `Warning at cycle ${point.x}. T24 exceeded the fleet range three times in ten cycles.`;
+              warning.hidden = false;
+            }
+          }
+          repeatedHighs = recentHighs.length >= 3;
+
+          if (point.x === finalCycle) failure.data.push(point);
+          chart.update();
+          status.textContent = "Replaying simulated readings";
+        } catch {
+          status.textContent = "Could not load the next reading. Retrying…";
+        } finally {
+          pending = false;
+        }
+      }, 500);
+    });
+  </script>
+</body>
+</html>
